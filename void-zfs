@@ -1,0 +1,196 @@
+#!bin/bash
+
+# Void Install (Native zfs encryption, zfsbootmenu & efistub)
+## Handbook here: https://docs.voidlinux.org/
+### Grab a void iso with zfs on, e.g. https://github.com/leahneukirchen/hrmpf
+#### Set BIOS to UEFI. Make sure net is up and running!
+
+### Initial config ### 
+
+# Install tools:
+xbps-install -Sy hdparm dosfstools gptfdisk vim wipefs
+
+# Load zfs module 
+modprobe zfs
+
+# Set vars in term (edit to liking)
+DEVICE=${DEVICE:-/dev/sda}
+ZPOOLNAME=${ZPOOLNAME:-zroot}
+USERNAME=${USERNAME:-void}
+
+### Partitioning/Mounting ###
+
+# Erase drive(!)
+
+# SSDs:
+## If frozen then suspend and retry, you want it set to 'not frozen'
+#hdparm -I ${DEVICE} | grep frozen
+#hdparm --user-master u --security-set-pass foo ${DEVICE}
+#hdparm --user-master u --security-erase foo ${DEVICE}
+
+# HDDs:
+## Short way:
+#wipefs -af ${DEVICE}
+
+## The proper way:
+shred -v -n 3 -z ${DEVICE}
+
+# Create partitions and format EFI partition
+## Partition 1 EFI 512M (CODE EF00), Partition 2 the rest of the disk
+gdisk ${DEVICE}
+mkfs.vfat ${DEVICE}1
+
+# Create a passphrase
+vim /etc/zfs/root.key
+chmod 000 /etc/zfs/root.key
+
+# Generate random hostid
+head /dev/urandom | tr -dc a-f0-9 | head -c 13 > /etc/hostid
+
+# Create zpool
+zpool create -f -o ashift=12 -o autotrim=on \
+-O compression=lz4 -O acltype=posixacl -O normalization=formD \
+-O xattr=sa -O relatime=on -O encryption=aes-256-gcm \
+-O keylocation=file:///etc/zfs/root.key -O keyformat=passphrase \
+-m none ${ZPOOLNAME} ${DEVICE}2
+
+# Create root volume
+zfs create -o mountpoint=none ${ZPOOLNAME}/ROOT
+zfs create -o mountpoint=/ -o canmount=noauto ${ZPOOLNAME}/ROOT/void
+
+# Export and re-import zpool, mount root volume to /mnt
+zpool export ${ZPOOLNAME}
+zpool import -N -R /mnt ${ZPOOLNAME}
+zfs load-key -L prompt ${ZPOOLNAME}
+zfs mount ${ZPOOLNAME}/ROOT/void
+
+# Create ZFS datasets
+zfs create -o mountpoint=/opt 			${ZPOOLNAME}/ROOT/void/opt
+zfs create -o mountpoint=/root 			${ZPOOLNAME}/ROOT/void/root
+zfs create -o canmount=off 			${ZPOOLNAME}/ROOT/void/usr
+zfs create -o mountpoint=/usr/local 		${ZPOOLNAME}/ROOT/void/usr/local
+zfs create -o mountpoint=/usr/src 		${ZPOOLNAME}/ROOT/void/usr/src
+zfs create -o mountpoint=/usr/src/void-packages ${ZPOOLNAME}/ROOT/void/usr/src/void-packages
+zfs create -o mountpoint=/var 			${ZPOOLNAME}/ROOT/void/var
+zfs create -o mountpoint=/var/db		${ZPOOLNAME}/ROOT/void/var/db
+zfs create -o mountpoint=/var/cache/xbps        ${ZPOOLNAME}/ROOT/void/var/distfiles
+zfs create -o mountpoint=/var/log 		${ZPOOLNAME}/ROOT/void/var/log
+zfs create -o mountpoint=/home 			${ZPOOLNAME}/HOME
+zfs create -o mountpoint=/home/${USERNAME} 	${ZPOOLNAME}/HOME/${USERNAME}
+
+# Check
+zpool status -v
+zpool list
+zfs list
+
+### Bootstrapping Void ### 
+
+# For GLIBC
+XBPS_ARCH=x86_64 xbps-install -S -R http://alpha.de.repo.voidlinux.org/current -r /mnt base-voidstrap
+
+# For MUSL
+#XBPS_ARCH=x86_64-musl xbps-install -S -R http://alpha.de.repo.voidlinux.org/current/musl -r /mnt base-voidstrap 
+
+# Mount pseudo-filesystems
+mount --rbind /sys /mnt/sys
+mount --rbind /dev /mnt/dev
+mount --rbind /proc /mnt/proc
+
+# Chroot
+cp -L /etc/resolv.conf /mnt/etc/
+cp /etc/hostid /mnt/etc/
+mkdir -p /mnt/etc/zfs
+cp /etc/zfs/root.key /mnt/etc/zfs/root.key
+PS1='(chroot) # ' chroot /mnt/ /bin/bash
+
+# Set vars again in chroot (edit to liking) 
+DEVICE=${DEVICE:-/dev/sda}
+HOSTID=$(cat /etc/hostid)
+ZPOOLNAME=${ZPOOLNAME:-zroot}
+
+### Void config ### 
+
+# If using glibc set locales
+echo "LANG=en_US.UTF-8 UTF-8" > /etc/locale.conf
+echo "LC_COLLATE=C" >> /etc/locale.conf
+echo "en_US.UTF-8 UTF-8" >> /etc/default/libc-locales
+xbps-reconfigure -f glibc-locales
+
+# Set Timezone 
+ln -sf /usr/share/zoneinfo/Europe/Warsaw /etc/localtime
+
+# Install editor of choice!
+xbps-install -S neovim
+
+# Edit host, rc.conf, set root pass
+echo ${ZPOOLNAME} > /etc/hostname
+vim /etc/rc.conf
+passwd 
+
+# Install packages (wpa_supplicant to get wifi running)
+xbps-install -Sy efibootmgr linux linux-headers linux-firmware wget wpa_supplicant zfs zfsbootmenu 
+
+# Fstab config
+cat << EOF > /etc/fstab
+$( blkid | grep ${DEVICE}1 | cut -d ' ' -f 2 ) /boot/efi vfat defaults,noauto 0 0
+tmpfs /tmp tmpfs rw,nodev,nosuid,mode=1777 0 0
+/tmp /var/tmp none rw,bind,nodev,nosuid,mode=1777 0 0
+EOF
+
+# Dracut config
+cat << EOF > /etc/dracut.conf.d/zol.conf
+nofsck="yes"
+add_dracutmodules+=" zfs "
+install_items+=" /etc/zfs/root.key "
+EOF
+
+# ZFSBootMenu config
+cat << EOF > /etc/zfsbootmenu/config.yaml
+Global:
+   ManageImages: true
+   BootMountPoint: /boot/efi
+   DracutConfDir: /etc/zfsbootmenu/dracut.conf.d
+Components:
+   ImageDir: /boot/efi/EFI/void
+   Versions: 1
+   Enabled: true
+EFI: 
+   ImageDir: /boot/efi/EFI/void
+   Stub: /etc/zfsbootmenu/linuxx64.efi.stub
+   Versions: false
+   Enabled: true
+Kernel:
+  CommandLine: ro quiet loglevel=0 spl_hostid=${HOSTID} zbm.prefer=${ZPOOLNAME}
+  Prefix: ZBM
+EOF
+
+# Grab standalone efistub
+cd /tmp
+wget https://aur.archlinux.org/cgit/aur.git/snapshot/efistub-standalone.tar.gz
+tar xf efistub-standalone.tar.gz
+cp efistub-standalone/linuxx64.efi.stub /etc/zfsbootmenu
+rm -rf efistub-standalone*
+
+# Set relevant zfs stuff (commandline is your preferred boot options!)
+zpool set bootfs=${ZPOOLNAME}/ROOT/void ${ZPOOLNAME}
+zpool set cachefile=/etc/zfs/zpool.cache ${ZPOOLNAME}
+zfs set org.zfsbootmenu:commandline="spl_hostid=${HOSTID} ro quiet net.ifnames=0" ${ZPOOLNAME}/ROOT
+
+### Bootloader config ### 
+
+# Mount EFI
+mkdir /boot/efi && mount /boot/efi
+
+# Reconfigure
+xbps-reconfigure -af
+
+# Configure EFI
+rm /mnt/boot/efi/EFI/void/*
+xbps-reconfigure -f zfsbootmenu
+efibootmgr -c -d ${DEVICE} -p 1 -L "ZFSBootMenu" -l \\EFI\\VOID\\ZBM.EFI
+
+# Exit, unmount and reboot
+umount -R /mnt
+zfs umount -a
+zpool export -a
+reboot
