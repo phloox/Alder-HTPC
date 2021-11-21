@@ -1,4 +1,4 @@
-#!bin/bash
+#!/bin/env bash
 
 # Void Install (Native zfs encryption, zfsbootmenu & efistub)
 ## Handbook here: https://docs.voidlinux.org/
